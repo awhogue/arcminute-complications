@@ -95,6 +95,25 @@ static bool s_face_clear = true;
 static int s_dial_style = 0;
 static GFont s_large_numeral_font;
 
+// ---- Complications ----
+#define COMP_FLANK_DEG 38
+#define COMP_FLANK_R 100
+#define PERSIST_COMP_MODE 11
+#define PERSIST_TEMP_UNIT 12
+#define PERSIST_TEMP_TENTHS_C 13
+#define PERSIST_TEMP_TIME 14
+#define COMP_SHOW_MS 5000
+#define WEATHER_MAX_AGE_S (30 * 60)
+
+static Layer *s_comp_layer;
+static AppTimer *s_comp_timer;
+static bool s_comp_visible = false;
+static int s_comp_mode = 0;   // 0 = show on shake/tap, 1 = always
+static int s_temp_unit = 0;   // 0 = Fahrenheit, 1 = Celsius
+static bool s_temp_known = false;
+static int s_temp_tenths_c = 0;
+static time_t s_temp_time = 0;
+
 static GColor background_color() {
   return s_background_color;
 }
@@ -154,7 +173,7 @@ static void outbox_sent_callback(DictionaryIterator *iterator, void *context);
 //   case 1:
 //     return fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
 //   case 2:
-//     return fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+//     return fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
 //   case 3:
 //     return fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 //   default:
@@ -187,6 +206,15 @@ static void battery_handler(BatteryChargeState charge_state)
   text_layer_set_text(s_battery_layer, s_battery_buffer);
 }
 
+static float current_hand_angle()
+{
+  time_t temp = time(NULL);
+  struct tm *t = localtime(&temp);
+  if (debug)
+    return 12 * t->tm_sec;
+  return 30 * ((float)(t->tm_hour % 12) + ((float)t->tm_min / 60));
+}
+
 static void update_frame_location()
 {
   time_t temp = time(NULL);
@@ -213,6 +241,7 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed)
   update_time();
   layer_mark_dirty(s_hand_layer);
   update_frame_location();
+  layer_mark_dirty(s_comp_layer);
 }
 
 static void my_hand_draw(Layer *layer, GContext *ctx)
@@ -388,6 +417,201 @@ static void my_face_draw(Layer *layer, GContext *ctx)
   }
 }
 
+// ---------------------------------------------------------------------------
+// Complications: date, steps and temperature, positioned relative to the hand.
+// The hand always lies on the line through the screen centre (the dial centre
+// orbits the screen centre directly opposite the hand), so every label can be
+// placed in polar coordinates around the screen centre using only the hand angle.
+// ---------------------------------------------------------------------------
+
+static void format_steps(char *buf, size_t len)
+{
+#if defined(PBL_HEALTH)
+  HealthServiceAccessibilityMask mask = health_service_metric_accessible(HealthMetricStepCount, time_start_of_today(), time(NULL));
+  if (mask & HealthServiceAccessibilityMaskAvailable)
+  {
+    int steps = (int)health_service_sum_today(HealthMetricStepCount);
+    if (steps < 1000)
+    {
+      snprintf(buf, len, "%d", steps);
+    }
+    else
+    {
+      int tenths = steps / 100; // truncate: 1449 -> 14 -> "1.4k"
+      snprintf(buf, len, "%d.%dk", tenths / 10, tenths % 10);
+    }
+    return;
+  }
+#endif
+  snprintf(buf, len, "--");
+}
+
+static void format_date(char *buf, size_t len)
+{
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  char wday[8];
+  strftime(wday, sizeof(wday), "%a", t);
+  snprintf(buf, len, "%s\n%d", wday, t->tm_mday);
+}
+
+static void format_temp(char *buf, size_t len)
+{
+  if (!s_temp_known)
+  {
+    snprintf(buf, len, "--°");
+    return;
+  }
+  int v10 = s_temp_unit == 1 ? s_temp_tenths_c : (s_temp_tenths_c * 9 / 5 + 320);
+  int v = (v10 + (v10 >= 0 ? 5 : -5)) / 10;
+  snprintf(buf, len, "%d°", v);
+}
+
+static void request_weather()
+{
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK)
+    return;
+  dict_write_uint8(iter, MESSAGE_KEY_WEATHER_REQUEST, 1);
+  app_message_outbox_send();
+}
+
+static void draw_label(GContext *ctx, GRect bounds, float angle_deg, int16_t radius,
+                       const char *text, GFont font, GColor bg)
+{
+  while (angle_deg < 0)
+    angle_deg += 360;
+  while (angle_deg >= 360)
+    angle_deg -= 360;
+
+  GRect ring = grect_inset(bounds, GEdgeInsets(bounds.size.w / 2 - radius));
+  GPoint c = gpoint_from_polar(ring, GOvalScaleModeFitCircle, DEG_TO_TRIGANGLE(angle_deg));
+
+  // Split on '\n' into up to two lines, drawn explicitly.
+  char lines[2][16];
+  int nlines = 1;
+  const char *nl = strchr(text, '\n');
+  if (nl)
+  {
+    size_t l0 = (size_t)(nl - text);
+    if (l0 >= sizeof(lines[0])) l0 = sizeof(lines[0]) - 1;
+    memcpy(lines[0], text, l0);
+    lines[0][l0] = 0;
+    strncpy(lines[1], nl + 1, sizeof(lines[1]) - 1);
+    lines[1][sizeof(lines[1]) - 1] = 0;
+    nlines = 2;
+  }
+  else
+  {
+    strncpy(lines[0], text, sizeof(lines[0]) - 1);
+    lines[0][sizeof(lines[0]) - 1] = 0;
+  }
+
+  const int16_t top_pad = 8; // Gothic metric dead-space above the glyphs
+  const int16_t pad = 3;
+  int16_t text_w = 0, line_h = 0;
+  for (int i = 0; i < nlines; i++)
+  {
+    GSize sz = graphics_text_layout_get_content_size(lines[i], font, GRect(0, 0, bounds.size.w, 40),
+                                                     GTextOverflowModeFill, GTextAlignmentCenter);
+    if (sz.w > text_w) text_w = sz.w;
+    line_h = sz.h;
+  }
+  const int16_t pitch = line_h - top_pad + 3;
+  GRect box = GRect(c.x - text_w / 2 - pad, c.y - (nlines * pitch) / 2 - 2, text_w + 2 * pad, nlines * pitch + 4);
+
+  // keep the label on screen
+  if (box.origin.x < 0) box.origin.x = 0;
+  if (box.origin.y < 0) box.origin.y = 0;
+  if (box.origin.x + box.size.w > bounds.size.w) box.origin.x = bounds.size.w - box.size.w;
+  if (box.origin.y + box.size.h > bounds.size.h) box.origin.y = bounds.size.h - box.size.h;
+
+  // keep the farthest corner inside the round screen: nudge the box toward the centre
+  {
+    const int16_t cx = bounds.size.w / 2, cy = bounds.size.h / 2;
+    const int16_t max_r = cx - 3;
+    for (int i = 0; i < 12; i++)
+    {
+      int16_t fx = box.origin.x + box.size.w / 2 < cx ? box.origin.x : box.origin.x + box.size.w;
+      int16_t fy = box.origin.y + box.size.h / 2 < cy ? box.origin.y : box.origin.y + box.size.h;
+      int32_t d2 = (fx - cx) * (fx - cx) + (fy - cy) * (fy - cy);
+      if (d2 <= (int32_t)max_r * max_r)
+        break;
+      box.origin.x += (box.origin.x + box.size.w / 2 < cx) ? 1 : -1;
+      box.origin.y += (box.origin.y + box.size.h / 2 < cy) ? 1 : -1;
+    }
+  }
+
+  graphics_context_set_fill_color(ctx, bg);
+  graphics_fill_rect(ctx, box, 4, GCornersAll);
+  graphics_context_set_text_color(ctx, color_is_light(bg) ? GColorBlack : GColorWhite);
+  for (int i = 0; i < nlines; i++)
+  {
+    graphics_draw_text(ctx, lines[i], font,
+                       GRect(box.origin.x, box.origin.y - top_pad + 2 + i * pitch, box.size.w, line_h),
+                       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  }
+}
+
+static void comp_draw(Layer *layer, GContext *ctx)
+{
+  GRect bounds = layer_get_bounds(layer);
+  GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD);
+  float theta = current_hand_angle();
+
+  // The hand tip sits (dial radius - orbit radius) from the screen centre.
+  GRect face_frame = layer_get_frame(s_face_layer);
+  int16_t tip_r = face_frame.size.w / 2 - (bounds.size.w / 2 + s_orbit_inset);
+  int16_t half = bounds.size.w / 2;
+  int16_t temp_r = (tip_r + half) / 2;
+
+  char date[24], steps[16], temp[16];
+  format_date(date, sizeof(date));
+  format_steps(steps, sizeof(steps));
+  format_temp(temp, sizeof(temp));
+
+  // Temp: beyond the hand tip, outside the dial.
+  draw_label(ctx, bounds, theta, temp_r, temp, font, background_color());
+  // Date / steps: flanking the empty wedge opposite the hand, inside the dial.
+  draw_label(ctx, bounds, theta + 180 - COMP_FLANK_DEG, COMP_FLANK_R, date, font, face_color());
+  draw_label(ctx, bounds, theta + 180 + COMP_FLANK_DEG, COMP_FLANK_R, steps, font, face_color());
+}
+
+static void comp_update_visibility()
+{
+  layer_set_hidden(s_comp_layer, !(s_comp_mode == 1 || s_comp_visible));
+}
+
+static void comp_hide_cb(void *data)
+{
+  s_comp_timer = NULL;
+  s_comp_visible = false;
+  comp_update_visibility();
+}
+
+static void tap_handler(AccelAxisType axis, int32_t direction)
+{
+  if (s_comp_mode == 1)
+    return;
+  if (s_comp_timer)
+    app_timer_cancel(s_comp_timer);
+  s_comp_timer = app_timer_register(COMP_SHOW_MS, comp_hide_cb, NULL);
+  s_comp_visible = true;
+  layer_mark_dirty(s_comp_layer);
+  comp_update_visibility();
+  if (!s_temp_known || time(NULL) - s_temp_time > WEATHER_MAX_AGE_S)
+    request_weather();
+}
+
+static void comp_apply_mode()
+{
+  accel_tap_service_unsubscribe();
+  if (s_comp_mode == 0)
+    accel_tap_service_subscribe(tap_handler);
+  comp_update_visibility();
+  layer_mark_dirty(s_comp_layer);
+}
+
 static void main_window_load(Window *window)
 {
   Layer *window_layer = window_get_root_layer(window);
@@ -418,11 +642,16 @@ static void main_window_load(Window *window)
   // text_layer_set_font(s_battery_layer, fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD));
   // text_layer_set_text_alignment(s_battery_layer, GTextAlignmentCenter);
 
+  s_comp_layer = layer_create(bounds);
+  layer_set_update_proc(s_comp_layer, comp_draw);
+
   update_frame_location();
 
   // Face below, hand on top so the hand renders over the dial and marks
   layer_add_child(window_layer, s_face_layer);
   layer_add_child(window_layer, s_hand_layer);
+  layer_add_child(window_layer, s_comp_layer);
+  comp_apply_mode();
 }
 
 static void inbox_received_callback(DictionaryIterator *iterator, void *context)
@@ -472,8 +701,34 @@ static void inbox_received_callback(DictionaryIterator *iterator, void *context)
     persist_write_bool(10, s_thick_hand);
   }
 
+  Tuple *comp_mode_tuple = dict_find(iterator, MESSAGE_KEY_COMP_MODE);
+  if (comp_mode_tuple)
+  {
+    s_comp_mode = comp_mode_tuple->value->int32;
+    persist_write_int(PERSIST_COMP_MODE, s_comp_mode);
+    comp_apply_mode();
+  }
+
+  Tuple *temp_unit_tuple = dict_find(iterator, MESSAGE_KEY_TEMP_UNIT);
+  if (temp_unit_tuple)
+  {
+    s_temp_unit = temp_unit_tuple->value->int32;
+    persist_write_int(PERSIST_TEMP_UNIT, s_temp_unit);
+  }
+
+  Tuple *temp_value_tuple = dict_find(iterator, MESSAGE_KEY_TEMP_VALUE);
+  if (temp_value_tuple)
+  {
+    s_temp_tenths_c = temp_value_tuple->value->int32;
+    s_temp_known = true;
+    s_temp_time = time(NULL);
+    persist_write_int(PERSIST_TEMP_TENTHS_C, s_temp_tenths_c);
+    persist_write_int(PERSIST_TEMP_TIME, (int32_t)s_temp_time);
+  }
+
   window_set_background_color(s_main_window, background_color());
   layer_mark_dirty(s_face_layer);
+  layer_mark_dirty(s_comp_layer);
   layer_mark_dirty(s_hand_layer);
 
   // Font size setting commented out - not working correctly
@@ -509,6 +764,8 @@ static void outbox_sent_callback(DictionaryIterator *iterator, void *context)
 static void main_window_unload(Window *window)
 {
   // Destroy TextLayer
+  layer_destroy(s_comp_layer);
+  layer_destroy(s_hand_layer);
   layer_destroy(s_face_layer);
 }
 
@@ -520,6 +777,14 @@ static void init()
   s_face_clear = persist_exists(8) ? persist_read_bool(8) : true;
   s_dial_style = persist_exists(9) ? persist_read_int(9) : 1;
   s_thick_hand = persist_exists(10) ? persist_read_bool(10) : false;
+  s_comp_mode = persist_exists(PERSIST_COMP_MODE) ? persist_read_int(PERSIST_COMP_MODE) : 0;
+  s_temp_unit = persist_exists(PERSIST_TEMP_UNIT) ? persist_read_int(PERSIST_TEMP_UNIT) : 0;
+  if (persist_exists(PERSIST_TEMP_TENTHS_C))
+  {
+    s_temp_known = true;
+    s_temp_tenths_c = persist_read_int(PERSIST_TEMP_TENTHS_C);
+    s_temp_time = persist_exists(PERSIST_TEMP_TIME) ? (time_t)persist_read_int(PERSIST_TEMP_TIME) : 0;
+  }
 
   s_large_numeral_font = fonts_load_custom_font(resource_get_handle(
 #if PBL_DISPLAY_WIDTH >= 200
@@ -561,6 +826,9 @@ static void init()
 
 static void deinit()
 {
+  accel_tap_service_unsubscribe();
+  if (s_comp_timer)
+    app_timer_cancel(s_comp_timer);
   fonts_unload_custom_font(s_large_numeral_font);
   window_destroy(s_main_window);
 }

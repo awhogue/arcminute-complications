@@ -1,7 +1,7 @@
 {
-  "name": "Arcminute",
-  "author": "Artifact",
-  "version": "2.6.0",
+  "name": "arcminute-complications",
+  "author": "MakeAwesomeHappen",
+  "version": "1.0.0",
   "keywords": [
     "pebble-watchface"
   ],
@@ -10,29 +10,23 @@
     "@rebble/clay": "^1.0.10"
   },
   "scripts": {
-    "install-emulator": "pebble build && pebble install --emulator gabbro && pebble logs",
-    "screenshots": "pebble build && pebble install --emulator aplite && pebble screenshot store/screenshots/screenshot_aplite.png --emulator aplite --no-open && pebble install --emulator basalt && pebble screenshot store/screenshots/screenshot_basalt.png --emulator basalt --no-open && pebble install --emulator chalk && pebble screenshot store/screenshots/screenshot_chalk.png --emulator chalk --no-open && pebble install --emulator diorite && pebble screenshot store/screenshots/screenshot_diorite.png --emulator diorite --no-open && pebble install --emulator emery && pebble screenshot store/screenshots/screenshot_emery.png --emulator emery --no-open && pebble install --emulator gabbro && pebble screenshot store/screenshots/screenshot_gabbro.png --emulator gabbro",
+    "install-emulator": "pebble build && pebble install --emulator gabbro --logs",
     "install-phone": "pebble build && pebble install --cloudpebble"
   },
   "pebble": {
-    "displayName": "Arcminute",
-    "uuid": "6ed35b3b-813b-402c-b3ed-c7d0146f70ec",
+    "displayName": "Arcminute Complications",
+    "uuid": "7a4a2270-121f-465e-9fcf-ed6f7c284727",
     "sdkVersion": "3",
     "enableMultiJS": true,
     "targetPlatforms": [
-      "aplite",
-      "basalt",
-      "chalk",
-      "diorite",
-      "emery",
-      "flint",
       "gabbro"
     ],
     "watchapp": {
       "watchface": true
     },
     "capabilities": [
-      "configurable"
+      "configurable",
+      "location"
     ],
     "messageKeys": [
       "BG_HEX",
@@ -40,7 +34,11 @@
       "HAND_HEX",
       "FACE_CLEAR",
       "DIAL_STYLE",
-      "THICK_HAND"
+      "THICK_HAND",
+      "COMP_MODE",
+      "TEMP_UNIT",
+      "TEMP_VALUE",
+      "WEATHER_REQUEST"
     ],
     "resources": {
       "media": [
@@ -54,17 +52,10 @@
           "type": "font",
           "name": "FONT_HELVETICA_95",
           "file": "fonts/Helvetica-Digits.ttf",
-          "characterRegex": "[0-9]",
-          "targetPlatforms": ["emery", "gabbro"]
-        },
-        {
-          "type": "font",
-          "name": "FONT_HELVETICA_67",
-          "file": "fonts/Helvetica-Digits.ttf",
-          "characterRegex": "[0-9]",
-          "targetPlatforms": ["aplite", "basalt", "chalk", "diorite", "flint"]
+          "characterRegex": "[0-9]"
         }
       ]
-    }
+    },
+    "manifestVersion": 1
   }
 }

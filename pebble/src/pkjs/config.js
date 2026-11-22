@@ -58,6 +58,36 @@ module.exports = [
     ]
   },
   {
+    "type": "section",
+    "items": [
+      {
+        "type": "heading",
+        "defaultValue": "Complications"
+      },
+      {
+        "type": "select",
+        "messageKey": "COMP_MODE",
+        "label": "Show complications",
+        "description": "Date, steps and temperature.",
+        "defaultValue": 0,
+        "options": [
+          { "label": "On shake / tap", "value": 0 },
+          { "label": "Always", "value": 1 }
+        ]
+      },
+      {
+        "type": "select",
+        "messageKey": "TEMP_UNIT",
+        "label": "Temperature unit",
+        "defaultValue": 0,
+        "options": [
+          { "label": "Fahrenheit (°F)", "value": 0 },
+          { "label": "Celsius (°C)", "value": 1 }
+        ]
+      }
+    ]
+  },
+  {
     "type": "submit",
     "defaultValue": "Save Settings"
   }
